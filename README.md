@@ -36,11 +36,11 @@ Before jumping into Kubernetes specifics, let's first understand what the model 
 ## How to do Inference capacity planning?
 To do capacity planning for your AI inference setup, you first need to understand the characteristics of the model you're going to serve. How many parameters does it have? Which precision does it use? What's the size of the context window? What's the average tokens per request?
 
-Let's take mistralai/Mistral-Large-Instruct-2411: 123B parameters, 128K context window, BF16 precision (2 bytes per parameter). Right off the bat you can say you need 246 GB of GPU memory just to host the weights (123B × 2 bytes).
+Let's take [mistralai/Mistral-Large-Instruct-2411](https://huggingface.co/mistralai/Mistral-Large-Instruct-2411): 123B parameters, 128K context window, BF16 precision (2 bytes per parameter). Right off the bat you can say you need 246 GB of GPU memory just to host the weights (123B × 2 bytes).
 
 For inference, GPU memory has to fit three things: model weights, activation overhead, and the KV cache. We know weights are 246 GB. Add ~30 GB for activations and CUDA overhead, so call it ~280 GB. But what about the KV cache? Remember, the KV cache is the space in HBM where prefill stores processed tokens and decode reads from and appends to, it needs enough room to handle all in-flight requests.
 
-There's a whole pile of math to compute KV cache size exactly. You need things like number of layers, number of KV heads, and head dimension, all of which you can find in the model's config.json.
+There's a whole pile of math to compute KV cache size exactly. You need things like number of layers, number of KV heads, and head dimension, all of which you can find in the model's [config.json](https://huggingface.co/mistralai/Mistral-Large-Instruct-2411/blob/main/config.json).
 On the hardware side, some of options you have today are: NVIDIA H100 (80 GB HBM3), H200 (141 GB HBM3e), B200 (192 GB HBM3e). A natural configuration for this model is 8× H100 on a single node, giving you 640 GB of HBM connected over NVLink.
 
 280 GB for weights + overhead leaves you ~360 GB for the KV cache. You want enough KV cache headroom for batched generation to actually scale, that's what lets you handle more concurrent requests and longer contexts.
@@ -192,6 +192,19 @@ A handful of metrics matter for inference SRE , and most of them aren't the ones
 - **GPU health via DCGM Exporter:** Xid errors, ECC errors, thermal throttling, NVLink status. At fleet scale these are routine; you need visibility.
 
 Tie these together: TTFT + TPOT tell you whether SLOs are at risk, KV cache + queue depth tell you why and feed scaling decisions, DCGM tells you when hardware is the problem. Without all three layers you'll be scaling reactively or chasing the wrong cause.
+
+One important aspect of observability for inference: avoid averages for latency. LLM latency distributions are heavily right-skewed, a single long prompt can take orders of magnitude longer to prefill than a typical one, and the mean gets dragged with it.
+
+Imagine 10 requests with TTFTs of 100, 102, 100, 99, 104, 110, 90, 3000, 95, and 105ms. The average is ~390ms, which makes the service look much slower than it actually is for almost every user, one outlier (probably a very long prompt or a cache miss) dominates the math. Use percentiles instead. They tell you what a specific portion of your users actually experience:
+
+- p50 (median), half your requests are faster than this, half are slower. Useful as a baseline but easy to be fooled by, since it ignores the tail.
+- p95, 95% of requests are faster than this. This is the one to alert on for most inference SLOs.
+- p99, your worst 1%. At scale this is still thousands of users per day having a bad experience. Track it, don't ignore it.
+
+A quick note on GPU utilization. The `nvidia-smi` "utilization" number is misleading, it only tells you whether a kernel is running, not whether the GPU is doing useful work. The right metrics are MFU (Model FLOPs Utilization) for prefill, which is compute-bound, and MBU (Memory Bandwidth Utilization) for decode, which is memory-bound. On an H100, healthy MFU during prefill is ~40–50%, and healthy MBU during decode is ~60–80%. You won't put these on a primary dashboard, but they're the metrics you reach for when answering "am I using this GPU efficiently or burning money?"
+
+One more thing worth saying, these metrics measure the health of the inference server, not the model. If your TTFT and TPOT look fine but users say the answers are bad, that's a model quality issue (prompt engineering, fine-tuning, model selection), not an inference infrastructure issue. The two get conflated all the time.
+
 
 ## Reliability
 
